@@ -1,9 +1,12 @@
 package ratelimit
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/zalando/skipper/metrics"
+	"github.com/zalando/skipper/metrics/metricstest"
 	"github.com/zalando/skipper/net"
 	"github.com/zalando/skipper/net/redistest"
 )
@@ -351,4 +354,49 @@ func Test_clusterLimitRedis_RetryAfter(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFailOpenOnRedisError(t *testing.T) {
+	dm := metrics.Default
+	defer func() { metrics.Default = dm }()
+
+	m := &metricstest.MockMetrics{}
+	metrics.Default = m
+
+	settings := Settings{
+		Type:       ClusterServiceRatelimit,
+		MaxHits:    10,
+		TimeWindow: 10 * time.Second,
+		Group:      "agroup",
+	}
+	// redis unavailable
+	ringClient := net.NewRedisRingClient(&net.RedisOptions{})
+	defer ringClient.Close()
+
+	c := newClusterRateLimiterRedis(
+		settings,
+		ringClient,
+		settings.Group,
+	)
+
+	allow := c.AllowContext(context.Background(), "akey")
+	if !allow {
+		t.Error("expected allow on error")
+	}
+	m.WithCounters(func(counters map[string]int64) {
+		if counters["swarm.redis.total"] != 1 {
+			t.Error("expected 1 total")
+		}
+		if counters["swarm.redis.allows"] != 1 {
+			t.Error("expected 1 allow on error")
+		}
+		if counters["swarm.redis.forbids"] != 0 {
+			t.Error("expected no forbids on error")
+		}
+	})
+	m.WithMeasures(func(measures map[string][]time.Duration) {
+		if _, ok := measures["swarm.redis.query.allow.failure.agroup"]; !ok {
+			t.Error("expected query allow failure on error")
+		}
+	})
 }
